@@ -5,3 +5,4 @@ timm
 grad-cam
 Pillow
 numpy
+opencv-python-headless
