@@ -11,7 +11,7 @@ from pytorch_grad_cam import GradCAMPlusPlus
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
-# ── Konfigurasi & Konstanta ───────────────────────────────────────────────────
+# Konfigurasi
 
 CLASS_NAMES = [
     "coto_makassar",
@@ -38,7 +38,7 @@ MEAN = np.array([0.485, 0.456, 0.406])
 STD = np.array([0.229, 0.224, 0.225])
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── Fungsi Pemrosesan & Model (Core Logic) ────────────────────────────────────
+# Fungsi Pemrosesan & Model
 
 @st.cache_resource(show_spinner=False)
 def load_model(model_name: str) -> torch.nn.Module:
@@ -58,7 +58,7 @@ def preprocess_image(pil_img: Image.Image) -> Tuple[torch.Tensor, np.ndarray]:
     """
     img = pil_img.convert("RGB")
     
-    # Resize sisi terpendek menjadi 256, lalu center-crop ke 224
+    # Resize sisi terpendek menjadi 256, lalu center crop ke 224
     w, h = img.size
     scale = 256 / min(w, h)
     img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.BILINEAR)
@@ -114,7 +114,7 @@ def predict_image(
     pred_idx = int(np.argmax(probs))
     return pred_idx, probs[pred_idx], probs
 
-# ── Fungsi Bantuan Antarmuka (UI Helpers) ─────────────────────────────────────
+# UI
 
 def format_label_name(name: str) -> str:
     """Memformat nama label agar lebih mudah dibaca (e.g., soto_ayam -> Soto Ayam)."""
@@ -128,8 +128,6 @@ def render_confidence_bars(probs: List[float]) -> None:
         col1.caption(format_label_name(CLASS_NAMES[i]))
         col2.progress(prob, text=f"{prob * 100:.1f}%")
 
-# ── Alur Utama Aplikasi (Main Loop) ───────────────────────────────────────────
-
 def main():
     st.set_page_config(
         page_title="Soto Classifier",
@@ -139,7 +137,7 @@ def main():
 
     st.title("Soto Classifier")
 
-    # Konfigurasi Sidebar
+    # Sidebar
     with st.sidebar:
         st.header("Pengaturan Model")
         model_name = st.radio(
@@ -176,7 +174,7 @@ def main():
         st.info("Silakan unggah gambar soto terlebih dahulu.", icon="📂")
         st.stop()
 
-    # ── Proses Inferensi & Grad-CAM ──
+    # Proses Inferensi & Grad-CAM
     pil_img = Image.open(io.BytesIO(uploaded_file.read()))
     input_tensor, rgb_arr = preprocess_image(pil_img)
 
@@ -187,7 +185,7 @@ def main():
         heatmap = generate_gradcam(model, input_tensor, pred_idx)
         cam_img = show_cam_on_image(rgb_arr, heatmap, use_rgb=True)
 
-    # ── Menampilkan Hasil ──
+    # Menampilkan Hasil
     pred_label = format_label_name(CLASS_NAMES[pred_idx])
 
     st.subheader(f"Prediksi: **{pred_label}**")
