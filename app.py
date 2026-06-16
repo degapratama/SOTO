@@ -1,3 +1,4 @@
+import cv2
 import io
 from typing import Tuple, List
 
