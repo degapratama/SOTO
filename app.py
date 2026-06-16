@@ -33,7 +33,7 @@ MODEL_CONFIGS = {
 
 IMG_SIZE = 224
 MEAN = np.array([0.485, 0.456, 0.406])
-STD  = np.array([0.229, 0.224, 0.225])
+STD = np.array([0.229, 0.224, 0.225])
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ── Fungsi Inti ──────────────────────────────────────────────────────────────
@@ -47,114 +47,59 @@ def load_model(model_name: str) -> torch.nn.Module:
     model.to(DEVICE).eval()
     return model
 
-
 def preprocess_image(pil_img: Image.Image) -> Tuple[torch.Tensor, Image.Image]:
+    """Resize, center-crop ke 224x224, normalisasi, dan kembalikan tensor + cropped PIL."""
     img = pil_img.convert("RGB")
     w, h = img.size
     scale = 256 / min(w, h)
     img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.BILINEAR)
     w, h = img.size
     left = (w - IMG_SIZE) // 2
-    top  = (h - IMG_SIZE) // 2
+    top = (h - IMG_SIZE) // 2
     img_cropped = img.crop((left, top, left + IMG_SIZE, top + IMG_SIZE))
 
-    arr  = np.array(img_cropped, dtype=np.float32) / 255.0
+    arr = np.array(img_cropped, dtype=np.float32) / 255.0
     norm = (arr - MEAN) / STD
     tensor = torch.from_numpy(norm.transpose(2, 0, 1)).float()
     return tensor.unsqueeze(0).to(DEVICE), img_cropped
-
-
-def attention_rollout(all_attn_weights: List[torch.Tensor]) -> np.ndarray:
-    """
-    Attention Rollout: menggabungkan attention dari SEMUA layer secara rekursif.
-    Menghasilkan peta perhatian yang lebih akurat untuk model besar (DeiT Base).
-    """
-    # Mulai dari identity matrix
-    result = torch.eye(all_attn_weights[0].size(-1)).to(all_attn_weights[0].device)
-
-    for attn in all_attn_weights:
-        # attn shape: (B, heads, tokens, tokens)
-        # Ambil max antar heads (lebih fokus dibanding mean)
-        attn_fused = attn[0].max(dim=0).values          # (tokens, tokens)
-
-        # Tambahkan residual connection (skip connection di transformer)
-        attn_fused = attn_fused + torch.eye(attn_fused.size(-1)).to(attn_fused.device)
-
-        # Normalisasi per baris
-        attn_fused = attn_fused / attn_fused.sum(dim=-1, keepdim=True)
-
-        # Kalikan dengan hasil sebelumnya (rollout)
-        result = attn_fused @ result
-
-    # Ambil baris CLS token (token ke-0), buang CLS itu sendiri → patch tokens
-    cls_attn = result[0, 1:]   # (num_patches,)
-    return cls_attn.cpu().numpy()
-
 
 @torch.no_grad()
 def predict_with_attention(
     model: torch.nn.Module,
     input_tensor: torch.Tensor,
-) -> Tuple[int, float, List[float], List[torch.Tensor]]:
-    """
-    Forward pass dengan hook untuk menangkap attention dari SEMUA blok transformer.
-    Diperlukan untuk Attention Rollout yang akurat.
-    """
-    all_attn_weights = []
-    hooks = []
+) -> Tuple[int, float, List[float], torch.Tensor]:
+    """Forward pass dengan hook untuk menangkap attention dari blok terakhir."""
+    attn_weights = None
 
-    def make_hook(idx):
-        def hook_fn(module, input, output):
-            x = input[0]
-            B, N, C = x.shape
-            head_dim = C // module.num_heads
-            qkv = module.qkv(x)
-            qkv = qkv.reshape(B, N, 3, module.num_heads, head_dim).permute(2, 0, 3, 1, 4)
-            q, k, _ = qkv[0], qkv[1], qkv[2]
-            attn = (q @ k.transpose(-2, -1)) * (head_dim ** -0.5)
-            attn = F.softmax(attn, dim=-1)
-            all_attn_weights.append(attn.detach())
-        return hook_fn
+    def hook_fn(module, input, output):
+        x = input[0]
+        B, N, C = x.shape
+        qkv = module.qkv(x)
+        qkv = qkv.reshape(B, N, 3, module.num_heads, C // module.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * (C // module.num_heads) ** -0.5
+        attn = F.softmax(attn, dim=-1)
+        nonlocal attn_weights
+        attn_weights = attn.detach()
 
-    # Daftarkan hook di SETIAP blok transformer
-    for i, block in enumerate(model.blocks):
-        h = block.attn.register_forward_hook(make_hook(i))
-        hooks.append(h)
-
+    handle = model.blocks[-1].attn.register_forward_hook(hook_fn)
     logits = model(input_tensor)
-    probs  = F.softmax(logits, dim=1).squeeze().cpu().tolist()
+    probs = F.softmax(logits, dim=1).squeeze().cpu().tolist()
     pred_idx = int(np.argmax(probs))
-
-    # Lepas semua hook
-    for h in hooks:
-        h.remove()
-
-    return pred_idx, probs[pred_idx], probs, all_attn_weights
-
+    handle.remove()
+    return pred_idx, probs[pred_idx], probs, attn_weights
 
 def generate_heatmap_overlay(
-    all_attn_weights: List[torch.Tensor],
+    attn: torch.Tensor,
     img_pil: Image.Image,
 ) -> Image.Image:
-    """
-    Menghasilkan overlay heatmap menggunakan Attention Rollout.
-    Jauh lebih akurat untuk DeiT Base dibanding rata-rata head saja.
-    """
-    # Hitung attention rollout dari semua layer
-    cls_attn = attention_rollout(all_attn_weights)   # (num_patches,)
-
-    num_patches = cls_attn.shape[0]
-    grid_size   = int(np.sqrt(num_patches))
-    attn_map    = cls_attn.reshape(grid_size, grid_size)
-
-    # Normalisasi
-    attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
-
-    # Terapkan threshold untuk membuang noise background (opsional tapi membantu)
-    threshold = np.percentile(attn_map, 60)   # hanya tampilkan 40% nilai tertinggi
-    attn_map  = np.where(attn_map >= threshold, attn_map, attn_map * 0.1)
-
-    # Re-normalisasi setelah threshold
+    """Menghasilkan gambar overlay heatmap dari attention."""
+    attn = attn[0]                      # (heads, tokens, tokens)
+    attn = attn.mean(dim=0)             # (tokens, tokens)
+    attn_class = attn[0, 1:]            # (num_patches,)
+    num_patches = attn_class.shape[0]
+    grid_size = int(np.sqrt(num_patches))
+    attn_map = attn_class.reshape(grid_size, grid_size).cpu().numpy()
     attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
 
     # Interpolasi ke 224x224
@@ -163,10 +108,10 @@ def generate_heatmap_overlay(
     attn_map_resized = attn_tensor.squeeze().cpu().numpy()
 
     # Buat heatmap berwarna
-    norm         = plt.Normalize(vmin=0, vmax=1)
+    norm = plt.Normalize(vmin=0, vmax=1)
     heatmap_rgba = cm.jet(norm(attn_map_resized))
-    heatmap_rgb  = (heatmap_rgba[:, :, :3] * 255).astype(np.uint8)
-    heatmap_pil  = Image.fromarray(heatmap_rgb, 'RGB')
+    heatmap_rgb = (heatmap_rgba[:, :, :3] * 255).astype(np.uint8)
+    heatmap_pil = Image.fromarray(heatmap_rgb, 'RGB')
 
     # Pastikan gambar asli ukuran 224x224
     if img_pil.size != (IMG_SIZE, IMG_SIZE):
@@ -174,19 +119,16 @@ def generate_heatmap_overlay(
 
     return Image.blend(img_pil, heatmap_pil, alpha=0.5)
 
-
 # ── UI Helpers ──────────────────────────────────────────────────────────────
 
 def format_label_name(name: str) -> str:
     return name.replace("_", " ").title()
-
 
 def render_confidence_bars(probs: List[float]) -> None:
     for i, prob in enumerate(probs):
         col1, col2 = st.columns([3, 7])
         col1.caption(format_label_name(CLASS_NAMES[i]))
         col2.progress(prob, text=f"{prob * 100:.1f}%")
-
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
@@ -210,33 +152,32 @@ def main():
             st.error(f"File model tidak ditemukan: `{MODEL_CONFIGS[model_name]['path']}`")
             st.stop()
 
-    uploaded_file = st.file_uploader(
-        "Unggah gambar soto",
-        type=["jpg", "jpeg", "png", "webp"],
-        label_visibility="collapsed",
-    )
+    uploaded_file = st.file_uploader("Unggah gambar soto", type=["jpg", "jpeg", "png", "webp"], label_visibility="collapsed")
     if not uploaded_file:
         st.info("Silakan unggah gambar soto terlebih dahulu.", icon="📂")
         st.stop()
 
+    # Baca gambar asli (mentah)
     pil_img_original = Image.open(io.BytesIO(uploaded_file.read()))
+    # Proses untuk model
     input_tensor, pil_img_cropped = preprocess_image(pil_img_original)
 
     with st.spinner("Sedang memproses gambar…"):
-        pred_idx, confidence, probs, all_attn_weights = predict_with_attention(model, input_tensor)
+        pred_idx, confidence, probs, attn = predict_with_attention(model, input_tensor)
 
     pred_label = format_label_name(CLASS_NAMES[pred_idx])
     st.subheader(f"Prediksi: **{pred_label}**")
     st.metric("Tingkat Keyakinan", f"{confidence * 100:.2f}%")
     st.divider()
 
+    # ── Tampilkan 2 Gambar ──
     col1, col2 = st.columns(2)
     with col1:
         st.image(pil_img_original, caption="Gambar Asli (Mentah)", use_container_width=True)
     with col2:
-        if all_attn_weights:
+        if attn is not None:
             try:
-                overlay_img = generate_heatmap_overlay(all_attn_weights, pil_img_cropped)
+                overlay_img = generate_heatmap_overlay(attn, pil_img_cropped)
                 st.image(overlay_img, caption="Heatmap Overlay", use_container_width=True)
             except Exception as e:
                 st.warning(f"Gagal membuat heatmap: {e}")
@@ -248,7 +189,6 @@ def main():
     st.divider()
     st.subheader("Probabilitas Kelas")
     render_confidence_bars(probs)
-
 
 if __name__ == "__main__":
     main()
