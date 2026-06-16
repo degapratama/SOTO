@@ -12,7 +12,8 @@ from timm import create_model
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
-# Konfigurasi
+# ── Konfigurasi & Konstanta ───────────────────────────────────────────────────
+
 CLASS_NAMES = [
     "coto_makassar",
     "soto_bandung",
@@ -38,8 +39,11 @@ MEAN = np.array([0.485, 0.456, 0.406])
 STD = np.array([0.229, 0.224, 0.225])
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ── Fungsi Pemrosesan & Model (Core Logic) ────────────────────────────────────
+
 @st.cache_resource(show_spinner=False)
 def load_model(model_name: str) -> torch.nn.Module:
+    """Memuat dan menyimpan model DeiT dari penyimpanan lokal ke dalam cache."""
     cfg = MODEL_CONFIGS[model_name]
     model = create_model(cfg["arch"], pretrained=False, num_classes=len(CLASS_NAMES))
     state = torch.load(cfg["path"], map_location=DEVICE)
@@ -50,7 +54,7 @@ def load_model(model_name: str) -> torch.nn.Module:
 def preprocess_image(pil_img: Image.Image) -> Tuple[torch.Tensor, Image.Image]:
     """
     Preprocess image: resize, center crop, normalize.
-    Returns tensor and also the cropped PIL image for display.
+    Returns tensor and cropped PIL image for display.
     """
     img = pil_img.convert("RGB")
     w, h = img.size
@@ -60,7 +64,7 @@ def preprocess_image(pil_img: Image.Image) -> Tuple[torch.Tensor, Image.Image]:
     left = (w - IMG_SIZE) // 2
     top = (h - IMG_SIZE) // 2
     img_cropped = img.crop((left, top, left + IMG_SIZE, top + IMG_SIZE))
-    
+
     arr = np.array(img_cropped, dtype=np.float32) / 255.0
     norm = (arr - MEAN) / STD
     tensor = torch.from_numpy(norm.transpose(2, 0, 1)).float()
@@ -115,9 +119,9 @@ def generate_heatmap(
 ) -> Tuple[Image.Image, Image.Image]:
     """
     Membuat heatmap dan overlay dari attention blok terakhir.
-    attn shape: (batch, heads, tokens, tokens)
+    Mengembalikan (heatmap_image, overlay_image) dalam format PIL.
     """
-    # Ambil batch pertama
+    # attn shape: (batch, heads, tokens, tokens)
     attn = attn[0]  # (heads, tokens, tokens)
     
     # Rata-rata antar kepala
@@ -141,7 +145,7 @@ def generate_heatmap(
     )
     attn_map_resized = attn_tensor.squeeze().cpu().numpy()
     
-    # Heatmap berwarna
+    # Buat heatmap berwarna dengan colormap 'jet'
     norm = plt.Normalize(vmin=0, vmax=1)
     heatmap_rgba = cm.jet(norm(attn_map_resized))  # (224,224,4)
     heatmap_rgb = (heatmap_rgba[:, :, :3] * 255).astype(np.uint8)
@@ -166,9 +170,15 @@ def render_confidence_bars(probs: List[float]) -> None:
         col2.progress(prob, text=f"{prob * 100:.1f}%")
 
 def main():
-    st.set_page_config(page_title="Soto Classifier", page_icon="🍜", layout="centered")
+    st.set_page_config(
+        page_title="Soto Classifier",
+        page_icon="🍜",
+        layout="centered",
+    )
+
     st.title("Soto Classifier")
 
+    # Konfigurasi Sidebar
     with st.sidebar:
         st.header("Pengaturan Model")
         model_name = st.radio(
@@ -178,10 +188,12 @@ def main():
         )
         st.caption(f"Berjalan menggunakan: **{str(DEVICE).upper()}**")
         st.divider()
+        
         st.markdown("**Daftar Kelas (Kategori):**")
         for cls in CLASS_NAMES:
             st.markdown(f"- {format_label_name(cls)}")
 
+    # Memuat Model
     with st.spinner(f"Memuat model {model_name}…"):
         try:
             model = load_model(model_name)
@@ -192,15 +204,18 @@ def main():
             )
             st.stop()
 
+    # Unggah Gambar
     uploaded_file = st.file_uploader(
         "Unggah gambar soto",
         type=["jpg", "jpeg", "png", "webp"],
         label_visibility="collapsed",
     )
+
     if not uploaded_file:
         st.info("Silakan unggah gambar soto terlebih dahulu.", icon="📂")
         st.stop()
 
+    # ── Proses Inferensi & Heatmap ──
     pil_img = Image.open(io.BytesIO(uploaded_file.read()))
     input_tensor, processed_img = preprocess_image(pil_img)
 
@@ -208,27 +223,34 @@ def main():
         pred_idx, confidence, probs, attn = predict_with_attention(model, input_tensor)
 
     pred_label = format_label_name(CLASS_NAMES[pred_idx])
+
     st.subheader(f"Prediksi: **{pred_label}**")
     st.metric("Tingkat Keyakinan", f"{confidence * 100:.2f}%")
     st.divider()
 
-    # Tampilkan gambar yang diproses
-    st.image(processed_img, caption="Gambar yang diproses (224x224)", use_container_width=True)
-
-    # --- HEATMAP ---
-    if attn is not None:
-        with st.spinner("Menghitung heatmap…"):
+    # Tampilkan gambar asli dan heatmap overlay dalam 2 kolom
+    col1, col2 = st.columns(2)
+    with col1:
+        st.image(
+            processed_img,
+            caption="Gambar Asli",
+            use_container_width=True,
+        )
+    with col2:
+        if attn is not None:
             try:
-                heatmap_img, overlay_img = generate_heatmap(attn, processed_img)
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.image(heatmap_img, caption="Heatmap (area perhatian)", use_container_width=True)
-                with col2:
-                    st.image(overlay_img, caption="Overlay", use_container_width=True)
+                _, overlay_img = generate_heatmap(attn, processed_img)
+                st.image(
+                    overlay_img,
+                    caption="Attention Heatmap Overlay",
+                    use_container_width=True,
+                )
             except Exception as e:
                 st.warning(f"Tidak dapat menampilkan heatmap: {e}")
-    else:
-        st.info("Attention tidak tersedia untuk model ini.")
+                st.image(processed_img, caption="Gambar Asli (Heatmap gagal)", use_container_width=True)
+        else:
+            st.info("Attention tidak tersedia untuk model ini.")
+            st.image(processed_img, caption="Gambar Asli (tanpa heatmap)", use_container_width=True)
 
     st.divider()
     st.subheader("Probabilitas Kelas")
