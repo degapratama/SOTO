@@ -65,26 +65,15 @@ def preprocess_image(pil_img: Image.Image) -> Tuple[torch.Tensor, Image.Image]:
 
 
 def attention_rollout(all_attn_weights: List[torch.Tensor]) -> np.ndarray:
-    """
-    Attention Rollout: menggabungkan attention dari SEMUA layer secara rekursif.
-    Menghasilkan peta perhatian yang lebih akurat untuk model besar (DeiT Base).
-    """
     result = torch.eye(all_attn_weights[0].size(-1)).to(all_attn_weights[0].device)
 
     for attn in all_attn_weights:
-        # attn shape: (B, heads, tokens, tokens)
-        # Ambil max antar heads (lebih fokus dibanding mean)
-        attn_fused = attn[0].max(dim=0).values          # (tokens, tokens)
-
-        # Tambahkan residual connection
+        attn_fused = attn[0].max(dim=0).values
         attn_fused = attn_fused + torch.eye(attn_fused.size(-1)).to(attn_fused.device)
-
-        # Normalisasi per baris
         attn_fused = attn_fused / attn_fused.sum(dim=-1, keepdim=True)
-
         result = attn_fused @ result
 
-    cls_attn = result[0, 1:]   # (num_patches,)
+    cls_attn = result[0, 1:]
     return cls_attn.cpu().numpy()
 
 
@@ -93,9 +82,6 @@ def predict_with_attention(
     model: torch.nn.Module,
     input_tensor: torch.Tensor,
 ) -> Tuple[int, float, List[float], List[torch.Tensor]]:
-    """
-    Forward pass dengan hook untuk menangkap attention dari SEMUA blok transformer.
-    """
     all_attn_weights = []
     hooks = []
 
@@ -127,7 +113,6 @@ def predict_with_attention(
 
 
 def attn_to_map(cls_attn: np.ndarray) -> np.ndarray:
-    """Reshape attention 1D → 2D → resize ke 224x224."""
     num_patches = cls_attn.shape[0]
     grid_size   = int(np.sqrt(num_patches))
     attn_map    = cls_attn.reshape(grid_size, grid_size)
@@ -139,7 +124,6 @@ def attn_to_map(cls_attn: np.ndarray) -> np.ndarray:
 
 
 def make_overlay(attn_map_resized: np.ndarray, img_pil: Image.Image, alpha: float = 0.5) -> Image.Image:
-    """Buat overlay heatmap + gambar asli."""
     norm         = plt.Normalize(vmin=0, vmax=1)
     heatmap_rgba = cm.jet(norm(attn_map_resized))
     heatmap_rgb  = (heatmap_rgba[:, :, :3] * 255).astype(np.uint8)
@@ -154,32 +138,9 @@ def make_overlay(attn_map_resized: np.ndarray, img_pil: Image.Image, alpha: floa
 def generate_heatmap_overlay(
     all_attn_weights: List[torch.Tensor],
     img_pil: Image.Image,
-    method: str = "rollout",
-    threshold_pct: int = 0,
 ) -> Image.Image:
-    """
-    Menghasilkan overlay heatmap.
-    method: 'rollout' | 'mean' | 'max'
-    threshold_pct: 0 = tanpa threshold, >0 = persentil cutoff
-    """
-    last_attn = all_attn_weights[-1]   # (B, heads, tokens, tokens)
-
-    if method == "rollout":
-        cls_attn = attention_rollout(all_attn_weights)
-    elif method == "mean":
-        attn_avg = last_attn[0].mean(dim=0)   # (tokens, tokens)
-        cls_attn = attn_avg[0, 1:].cpu().numpy()
-    else:  # max
-        attn_max = last_attn[0].max(dim=0).values
-        cls_attn = attn_max[0, 1:].cpu().numpy()
-
+    cls_attn = attention_rollout(all_attn_weights)
     attn_map = attn_to_map(cls_attn)
-
-    if threshold_pct > 0:
-        threshold = np.percentile(attn_map, threshold_pct)
-        attn_map  = np.where(attn_map >= threshold, attn_map, attn_map * 0.1)
-        attn_map  = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
-
     return make_overlay(attn_map, img_pil)
 
 
@@ -187,17 +148,13 @@ def generate_per_head_overlays(
     all_attn_weights: List[torch.Tensor],
     img_pil: Image.Image,
 ) -> List[Tuple[str, Image.Image]]:
-    """
-    Buat overlay heatmap untuk SETIAP head di layer terakhir.
-    Return list of (label, overlay_image).
-    """
-    last_attn  = all_attn_weights[-1]   # (B, heads, tokens, tokens)
-    num_heads  = last_attn.shape[1]
-    results    = []
+    last_attn = all_attn_weights[-1]
+    num_heads = last_attn.shape[1]
+    results   = []
 
     for h_idx in range(num_heads):
-        attn_head = last_attn[0, h_idx]       # (tokens, tokens)
-        cls_attn  = attn_head[0, 1:].cpu().numpy()   # (num_patches,)
+        attn_head = last_attn[0, h_idx]
+        cls_attn  = attn_head[0, 1:].cpu().numpy()
         attn_map  = attn_to_map(cls_attn)
         overlay   = make_overlay(attn_map, img_pil, alpha=0.5)
         results.append((f"Head {h_idx + 1}", overlay))
@@ -221,7 +178,7 @@ def render_confidence_bars(probs: List[float]) -> None:
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    st.set_page_config(page_title="Soto Classifier", page_icon="🍜", layout="wide")
+    st.set_page_config(page_title="Soto Classifier", page_icon="🍜", layout="centered")
     st.title("Soto Classifier")
 
     with st.sidebar:
@@ -231,27 +188,10 @@ def main():
 
         st.divider()
         st.header("Pengaturan Heatmap")
-        heatmap_method = st.selectbox(
-            "Metode Agregasi:",
-            options=["rollout", "max", "mean"],
-            format_func=lambda x: {
-                "rollout": "Attention Rollout (direkomendasikan)",
-                "max":     "Max antar heads (terfokus)",
-                "mean":    "Mean antar heads (tersebar)",
-            }[x],
-        )
-        threshold_pct = st.slider(
-            "Threshold (%)",
-            min_value=0,
-            max_value=90,
-            value=0,
-            step=5,
-            help="0 = tanpa threshold (tampilkan semua). Semakin tinggi = semakin fokus ke area penting saja.",
-        )
         show_per_head = st.checkbox("Tampilkan semua head secara terpisah", value=False)
 
         st.divider()
-        st.markdown("**Daftar Kelas:**")
+        st.markdown("**Daftar Kelas (Kategori):**")
         for cls in CLASS_NAMES:
             st.markdown(f"- {format_label_name(cls)}")
 
@@ -285,23 +225,12 @@ def main():
     # ── Gambar Asli + Heatmap Utama ──
     col1, col2 = st.columns(2)
     with col1:
-        st.image(pil_img_original, caption="Gambar Asli", use_container_width=True)
+        st.image(pil_img_original, caption="Gambar Asli (Mentah)", use_container_width=True)
     with col2:
         if all_attn_weights:
             try:
-                overlay_img = generate_heatmap_overlay(
-                    all_attn_weights,
-                    pil_img_cropped,
-                    method=heatmap_method,
-                    threshold_pct=threshold_pct,
-                )
-                method_label = {
-                    "rollout": "Attention Rollout",
-                    "max":     "Max Heads",
-                    "mean":    "Mean Heads",
-                }[heatmap_method]
-                thr_label = f" | Threshold {threshold_pct}%" if threshold_pct > 0 else " | Tanpa Threshold"
-                st.image(overlay_img, caption=f"Heatmap Overlay ({method_label}{thr_label})", use_container_width=True)
+                overlay_img = generate_heatmap_overlay(all_attn_weights, pil_img_cropped)
+                st.image(overlay_img, caption="Heatmap Overlay", use_container_width=True)
             except Exception as e:
                 st.warning(f"Gagal membuat heatmap: {e}")
                 st.image(pil_img_cropped, caption="Gambar yang diproses (tanpa heatmap)", use_container_width=True)
@@ -314,12 +243,11 @@ def main():
         st.divider()
         num_heads = all_attn_weights[-1].shape[1]
         st.subheader(f"Visualisasi Per Head — Layer Terakhir ({num_heads} heads)")
-        st.caption("Setiap head menunjukkan 'sudut pandang' perhatian yang berbeda. Tanpa threshold.")
+        st.caption("Setiap head menunjukkan 'sudut pandang' perhatian yang berbeda.")
 
         with st.spinner("Membuat visualisasi per head…"):
             per_head_imgs = generate_per_head_overlays(all_attn_weights, pil_img_cropped)
 
-        # Tampilkan dalam grid 4 kolom
         cols_per_row = 4
         for row_start in range(0, len(per_head_imgs), cols_per_row):
             row_imgs = per_head_imgs[row_start : row_start + cols_per_row]
