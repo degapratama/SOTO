@@ -41,7 +41,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 @st.cache_resource(show_spinner=False)
 def load_model(model_name: str) -> torch.nn.Module:
     cfg = MODEL_CONFIGS[model_name]
-    # Jangan set output_attentions=True (tidak didukung)
     model = create_model(cfg["arch"], pretrained=False, num_classes=len(CLASS_NAMES))
     state = torch.load(cfg["path"], map_location=DEVICE)
     model.load_state_dict(state)
@@ -74,29 +73,41 @@ def predict_with_attention(
 ) -> Tuple[int, float, List[float], torch.Tensor]:
     """
     Forward pass dengan hook untuk menangkap attention dari blok terakhir.
-    Mengembalikan prediksi, confidence, probabilitas, dan attention weights (tensor).
+    Menghitung attention weights secara manual dari Q dan K.
     """
-    # List untuk menyimpan attention
-    attentions = []
-    
+    attn_weights = None
+
     def hook_fn(module, input, output):
-        # output adalah attention weights: (batch, heads, N, N)
-        attentions.append(output.detach())
-    
+        # input adalah tuple (x,) ; x shape (batch, tokens, dim)
+        x = input[0]  # (B, N, C)
+        B, N, C = x.shape
+        
+        # Dapatkan qkv dari modul attention
+        qkv = module.qkv(x)  # (B, N, 3*C)
+        # Reshape menjadi (B, N, 3, num_heads, head_dim)
+        qkv = qkv.reshape(B, N, 3, module.num_heads, C // module.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # masing-masing (B, heads, N, head_dim)
+        
+        # Hitung attention scores
+        attn = (q @ k.transpose(-2, -1)) * (C // module.num_heads) ** -0.5
+        attn = F.softmax(attn, dim=-1)  # (B, heads, N, N)
+        
+        # Simpan ke variabel luar
+        nonlocal attn_weights
+        attn_weights = attn.detach()
+
     # Pasang hook pada modul attention di blok terakhir
     handle = model.blocks[-1].attn.register_forward_hook(hook_fn)
-    
-    # Forward pass (model akan memanggil forward_features dan head)
+
+    # Forward pass
     logits = model(input_tensor)
     probs = F.softmax(logits, dim=1).squeeze().cpu().tolist()
     pred_idx = int(np.argmax(probs))
-    
+
     # Lepas hook
     handle.remove()
-    
-    # Ambil attention (seharusnya hanya satu)
-    attn = attentions[0] if attentions else None
-    return pred_idx, probs[pred_idx], probs, attn
+
+    return pred_idx, probs[pred_idx], probs, attn_weights
 
 def generate_heatmap(
     attn: torch.Tensor,
@@ -104,37 +115,39 @@ def generate_heatmap(
 ) -> Tuple[Image.Image, Image.Image]:
     """
     Membuat heatmap dan overlay dari attention blok terakhir.
-    Mengembalikan (heatmap_image, overlay_image) dalam format PIL.
+    attn shape: (batch, heads, tokens, tokens)
     """
-    # attn shape: (batch, heads, num_tokens, num_tokens)
-    attn = attn[0]                      # (heads, num_tokens, num_tokens)
-    attn = attn.mean(dim=0)             # rata-rata antar kepala -> (num_tokens, num_tokens)
+    # Ambil batch pertama
+    attn = attn[0]  # (heads, tokens, tokens)
     
-    # Class token berada di indeks 0, ambil attention ke semua patch (indeks 1..end)
-    attn_class = attn[0, 1:]            # (num_patches,)
+    # Rata-rata antar kepala
+    attn = attn.mean(dim=0)  # (tokens, tokens)
     
-    # Reshape ke grid (14x14 untuk patch size 16 pada 224x224)
+    # Ambil perhatian dari class token ke semua patch (indeks 0 ke 1..end)
+    attn_class = attn[0, 1:]  # (num_patches,)
+    
+    # Reshape ke grid 14x14 (patch size 16)
     num_patches = attn_class.shape[0]
-    grid_size = int(np.sqrt(num_patches))  # harusnya 14
+    grid_size = int(np.sqrt(num_patches))  # 14
     attn_map = attn_class.reshape(grid_size, grid_size).cpu().numpy()
     
-    # Normalisasi ke [0,1]
+    # Normalisasi
     attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
     
-    # Interpolasi ke ukuran 224x224
+    # Interpolasi ke 224x224
     attn_tensor = torch.from_numpy(attn_map).float().unsqueeze(0).unsqueeze(0)
     attn_tensor = F.interpolate(
         attn_tensor, size=(IMG_SIZE, IMG_SIZE), mode='bilinear', align_corners=False
     )
     attn_map_resized = attn_tensor.squeeze().cpu().numpy()
     
-    # Buat heatmap berwarna dengan colormap 'jet'
+    # Heatmap berwarna
     norm = plt.Normalize(vmin=0, vmax=1)
     heatmap_rgba = cm.jet(norm(attn_map_resized))  # (224,224,4)
     heatmap_rgb = (heatmap_rgba[:, :, :3] * 255).astype(np.uint8)
     heatmap_pil = Image.fromarray(heatmap_rgb, 'RGB')
     
-    # Pastikan gambar asli berukuran 224x224
+    # Pastikan gambar asli ukuran 224x224
     if img_pil.size != (IMG_SIZE, IMG_SIZE):
         img_pil = img_pil.resize((IMG_SIZE, IMG_SIZE), Image.Resampling.BILINEAR)
     
