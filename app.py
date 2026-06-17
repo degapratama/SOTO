@@ -144,24 +144,6 @@ def generate_heatmap_overlay(
     return make_overlay(attn_map, img_pil)
 
 
-def generate_per_head_overlays(
-    all_attn_weights: List[torch.Tensor],
-    img_pil: Image.Image,
-) -> List[Tuple[str, Image.Image]]:
-    last_attn = all_attn_weights[-1]
-    num_heads = last_attn.shape[1]
-    results   = []
-
-    for h_idx in range(num_heads):
-        attn_head = last_attn[0, h_idx]
-        cls_attn  = attn_head[0, 1:].cpu().numpy()
-        attn_map  = attn_to_map(cls_attn)
-        overlay   = make_overlay(attn_map, img_pil, alpha=0.5)
-        results.append((f"Head {h_idx + 1}", overlay))
-
-    return results
-
-
 # ── UI Helpers ──────────────────────────────────────────────────────────────
 
 def format_label_name(name: str) -> str:
@@ -185,11 +167,6 @@ def main():
         st.header("Pengaturan Model")
         model_name = st.radio("Pilih Model:", options=list(MODEL_CONFIGS.keys()), index=0)
         st.caption(f"Berjalan menggunakan: **{str(DEVICE).upper()}**")
-
-        st.divider()
-        st.header("Pengaturan Heatmap")
-        show_per_head = st.checkbox("Tampilkan semua head secara terpisah", value=False)
-
         st.divider()
         st.markdown("**Daftar Kelas (Kategori):**")
         for cls in CLASS_NAMES:
@@ -222,7 +199,6 @@ def main():
     st.metric("Tingkat Keyakinan", f"{confidence * 100:.2f}%")
     st.divider()
 
-    # ── Gambar Asli + Heatmap Utama ──
     col1, col2 = st.columns(2)
     with col1:
         st.image(pil_img_original, caption="Gambar Asli (Mentah)", use_container_width=True)
@@ -237,24 +213,6 @@ def main():
         else:
             st.info("Attention tidak tersedia.")
             st.image(pil_img_cropped, caption="Gambar yang diproses", use_container_width=True)
-
-    # ── Tampilkan Semua Head ──
-    if show_per_head and all_attn_weights:
-        st.divider()
-        num_heads = all_attn_weights[-1].shape[1]
-        st.subheader(f"Visualisasi Per Head — Layer Terakhir ({num_heads} heads)")
-        st.caption("Setiap head menunjukkan 'sudut pandang' perhatian yang berbeda.")
-
-        with st.spinner("Membuat visualisasi per head…"):
-            per_head_imgs = generate_per_head_overlays(all_attn_weights, pil_img_cropped)
-
-        cols_per_row = 4
-        for row_start in range(0, len(per_head_imgs), cols_per_row):
-            row_imgs = per_head_imgs[row_start : row_start + cols_per_row]
-            cols = st.columns(cols_per_row)
-            for col, (label, img) in zip(cols, row_imgs):
-                with col:
-                    st.image(img, caption=label, use_container_width=True)
 
     st.divider()
     st.subheader("Probabilitas Kelas")
