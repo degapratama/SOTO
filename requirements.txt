@@ -2,7 +2,6 @@ streamlit
 torch
 torchvision
 timm
-grad-cam==1.5.5
-opencv-python-headless==4.10.0.84
 Pillow
 numpy
+matplotlib
